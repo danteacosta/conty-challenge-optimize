@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS deliveries (
   creator_id TEXT NOT NULL,
   delivered_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS accounts_creator ON social_accounts (creator_id, id);
+CREATE INDEX IF NOT EXISTS metrics_latest ON metrics (account_id, captured_at DESC, id DESC, views);
+CREATE INDEX IF NOT EXISTS deliveries_creator_date ON deliveries (creator_id, delivered_at);
 `;
 
 type SqlValue = string | number | bigint | null;
@@ -49,6 +52,10 @@ export function getQueryCount(): number {
 
 export function openDatabase(path = ":memory:"): DatabaseSync {
   const db = new DatabaseSync(path);
+  // SQLite ordena texto por UTF-8; o contrato original compara unidades UTF-16 do JavaScript.
+  db.function("js_string_key", { deterministic: true }, (value) =>
+    Buffer.from(String(value), "utf16le").swap16(),
+  );
   db.exec(SCHEMA);
   return db;
 }

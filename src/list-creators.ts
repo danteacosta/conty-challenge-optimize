@@ -40,34 +40,28 @@ export async function listCreators(
   const creators = await all<CreatorMatch>(
     db,
     `WITH scored AS (${SCORED}),
-     latest_metric AS (
-       SELECT a.creator_id AS creator_id,
-              m.views AS views,
-              ROW_NUMBER() OVER (PARTITION BY m.account_id ORDER BY m.captured_at DESC, m.id DESC) AS rn
-         FROM metrics m
-         JOIN social_accounts a ON a.id = m.account_id
+     ranked AS (
+       SELECT s.id, s.name, s.niche_score,
+              COALESCE((SELECT SUM(COALESCE((
+                SELECT m.views FROM metrics m WHERE m.account_id = a.id
+                 ORDER BY m.captured_at DESC, m.id DESC LIMIT 1
+              ), 0)) FROM social_accounts a WHERE a.creator_id = s.id), 0) AS latest_reach
+         FROM scored s WHERE s.niche_score > 0
      ),
-     reach AS (
-       SELECT creator_id, SUM(views) AS latest_reach FROM latest_metric WHERE rn = 1 GROUP BY creator_id
-     ),
-     delivered AS (
-       SELECT creator_id, COUNT(*) AS n FROM deliveries WHERE delivered_at >= ? GROUP BY creator_id
+     page AS (
+       SELECT * FROM ranked
+        ORDER BY niche_score DESC, latest_reach DESC, js_string_key(id) ASC
+        LIMIT ? OFFSET ?
      )
-     SELECT s.id AS id,
-            s.name AS name,
-            s.niche_score AS niche_score,
-            COALESCE(r.latest_reach, 0) AS latest_reach,
-            COALESCE(d.n, 0) AS deliveries_90d
-       FROM scored s
-       LEFT JOIN reach r ON r.creator_id = s.id
-       LEFT JOIN delivered d ON d.creator_id = s.id
-      WHERE s.niche_score > 0
-      ORDER BY s.niche_score DESC, latest_reach DESC, s.id ASC
-      LIMIT ? OFFSET ?`,
+     SELECT p.id, p.name, p.niche_score, p.latest_reach,
+            (SELECT COUNT(*) FROM deliveries d
+              WHERE d.creator_id = p.id AND d.delivered_at >= ?) AS deliveries_90d
+       FROM page p
+      ORDER BY p.niche_score DESC, p.latest_reach DESC, js_string_key(p.id) ASC`,
     campaign.niches_json,
-    deliveriesSince(),
     input.limit,
     input.offset,
+    deliveriesSince(),
   );
 
   // O total é separado da página para continuar correto quando o offset passa do fim.

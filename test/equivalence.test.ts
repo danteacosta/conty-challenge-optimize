@@ -22,6 +22,35 @@ async function expectSameAsReference(db: ReturnType<typeof openDatabase>, campai
 }
 
 describe("listagem igual à original", () => {
+  it("desempata IDs Unicode na ordem JavaScript antes de paginar e preserva nichos repetidos", async () => {
+    const db = openDatabase();
+    db.prepare("INSERT INTO campaigns VALUES (?, ?, ?)").run("unicode", "Unicode", '["moda","moda"]');
+    for (const id of ["\uE000", "\u{10000}", "a"]) {
+      db.prepare("INSERT INTO creators VALUES (?, ?, ?, ?)").run(id, id, '["moda","moda"]', "");
+    }
+    for (const offset of [0, 1, 2, 3]) {
+      const input = { campaignId: "unicode", limit: 1, offset };
+      expect(await listCreators(db, input)).toEqual(await referenceListCreators(db, input));
+    }
+    db.close();
+  });
+  it("ordena IDs Unicode dentro da própria página (limit maior que 1), igual à ordem JavaScript", async () => {
+    const db = openDatabase();
+    db.prepare("INSERT INTO campaigns VALUES (?, ?, ?)").run("unicode_page", "Unicode", '["moda"]');
+    for (const id of ["\uE000", "\u{10000}", "a", "\u{1F600}", "\uFFFF"]) {
+      db.prepare("INSERT INTO creators VALUES (?, ?, ?, ?)").run(id, id, '["moda"]', "");
+    }
+    for (const input of [
+      { campaignId: "unicode_page", limit: 5, offset: 0 },
+      { campaignId: "unicode_page", limit: 3, offset: 0 },
+      { campaignId: "unicode_page", limit: 3, offset: 2 },
+    ]) {
+      const actual = await listCreators(db, input);
+      expect(actual).toEqual(await referenceListCreators(db, input));
+    }
+    db.close();
+  });
+
   it.each([
     { creators: 80, seed: 7 },
     { creators: 600, seed: 7 },
