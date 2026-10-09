@@ -11,9 +11,13 @@ O patch desta rodada foi escrito e revisado pelo Codex. Eu (Claude Code) o apliq
 
 ## Verificação
 
-- `npm test`: 20/20 e `npm run typecheck` limpo em Node 22.15.0 e em 24.7.0. Os testes originais, `fixtures/page-1.json` e `src/app.ts` não mudaram.
+- `npm test`: 30/30 (20 anteriores + 10 de consistência) e `npm run typecheck` limpo em Node 22.15.0 e em 24.7.0. Os testes originais, `fixtures/page-1.json` e `src/app.ts` não mudaram.
 - O teste Unicode falha contra o código anterior e passa com o novo. A mutação manual no SQL (ordem, desempate da métrica, limite dos 90 dias, `OFFSET`, score zero, função UTF-16, ordem final da página) foi pega pelos testes, com uma exceção equivalente na prática: remover o `m.id DESC` da métrica não falha, porque o índice `metrics_latest` já entrega nessa ordem. Mantive o `id DESC` explícito no SQL para a regra não depender do plano de execução.
 - Benchmark (`npm run bench`, seed 2000/7, Node 24.7, 5 execuções cada, mesma máquina): 3 queries nos dois casos; p95 de **13,8 a 24,4 ms antes** e de **6,1 a 10,9 ms depois**. A auditoria mediu 13,2 → 6,6 ms. É ruidoso e local: serve como ordem de grandeza, não como garantia. Os índices também aceleram o oráculo de teste, então parte da diferença não é só do SQL novo.
+
+## Página e total do mesmo estado
+
+A listagem fazia três consultas separadas por `await`: campanha, página e total. Com uma escrita no meio (por exemplo, um criador excluído depois da consulta da página e antes da do total) a resposta saía com `total: 0` e um criador na página. Num banco parado isso não aparece, por isso o oráculo de equivalência não pega. Agora as três leituras rodam numa função síncrona dentro de um `BEGIN`/`COMMIT` (`readSnapshot` em `src/db.ts`): nenhum outro tratador da mesma conexão roda no meio e, em arquivo com WAL, quem escreve por outra conexão também não é visto no meio. A função não contém `await`, para a transação nunca ficar aberta por cima de espera nem de rede. Continuam 3 queries (teto de 8), a ordenação UTF-16 e o score com multiplicidade. `test/consistency.test.ts` roda um escritor em sete pontos diferentes da listagem (apagando e inserindo) e exige que a resposta seja inteira do estado anterior ou do posterior; contra o código anterior ele falha. Bench depois da mudança: 3 queries, p95 5,3 ms (uma execução, mesma máquina).
 
 ## Riscos
 

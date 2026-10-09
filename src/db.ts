@@ -60,6 +60,32 @@ export function openDatabase(path = ":memory:"): DatabaseSync {
   return db;
 }
 
+/** Leituras síncronas: contam como query, e como não cedem a vez entre uma e outra, nada as separa de uma escrita. */
+export function allNow<T>(db: DatabaseSync, sql: string, ...params: SqlValue[]): T[] {
+  queryCount += 1;
+  return db.prepare(sql).all(...params) as T[];
+}
+
+export function getNow<T>(db: DatabaseSync, sql: string, ...params: SqlValue[]): T | undefined {
+  queryCount += 1;
+  const row = db.prepare(sql).get(...params);
+  return row === undefined || row === null ? undefined : (row as T);
+}
+
+/**
+ * Executa várias leituras como um único retrato do banco. Duas proteções: a função é síncrona (nenhum outro tratador da mesma
+ * conexão roda no meio) e o BEGIN/COMMIT fixa o retrato para quem escreve por outra conexão (em WAL, a leitura enxerga um
+ * estado só). Não pode conter `await`: segurar uma transação aberta por cima de espera é o que isso evita.
+ */
+export function readSnapshot<T>(db: DatabaseSync, read: () => T): T {
+  db.exec("BEGIN");
+  try {
+    return read();
+  } finally {
+    db.exec("COMMIT");
+  }
+}
+
 export async function all<T>(db: DatabaseSync, sql: string, ...params: SqlValue[]): Promise<T[]> {
   queryCount += 1;
   return db.prepare(sql).all(...params) as T[];
