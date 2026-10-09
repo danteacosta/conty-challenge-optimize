@@ -2,6 +2,12 @@ import { describe, expect, it } from "vitest";
 import { getQueryCount, openDatabase, resetQueryCount } from "../src/db.ts";
 import { listCreators } from "../src/list-creators.ts";
 
+/** Sem transação aberta: um BEGIN novo só funciona se não houver outra (db.isTransaction só existe a partir do Node 24). */
+function expectNoOpenTransaction(db: ReturnType<typeof openDatabase>) {
+  db.exec("BEGIN");
+  db.exec("ROLLBACK");
+}
+
 function database(creators: number) {
   const db = openDatabase(":memory:");
   db.prepare("INSERT INTO campaigns VALUES (?, ?, ?)").run("c", "Campanha", '["x"]');
@@ -49,8 +55,8 @@ describe("a página e o total vêm do mesmo estado, mesmo com escrita no meio da
   it("a leitura não deixa uma transação aberta, nem quando a consulta falha", async () => {
     const db = database(1);
     await listCreators(db, { campaignId: "c", limit: 20, offset: 0 });
-    expect(db.isTransaction).toBe(false);
+    expectNoOpenTransaction(db);
     await expect(listCreators(db, { campaignId: "c", limit: Number.NaN, offset: 0 })).rejects.toThrow();
-    expect(db.isTransaction).toBe(false);
+    expectNoOpenTransaction(db);
   });
 });
