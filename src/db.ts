@@ -60,6 +60,25 @@ export function openDatabase(path = ":memory:"): DatabaseSync {
   return db;
 }
 
+/**
+ * Leituras síncronas que devolvem inteiros como BigInt: a soma de contas individualmente seguras pode passar de 2^53, e o driver
+ * recusa ler esse inteiro como número. Contam como query igual às outras.
+ */
+export function allBig<T>(db: DatabaseSync, sql: string, ...params: SqlValue[]): T[] {
+  queryCount += 1;
+  const statement = db.prepare(sql);
+  statement.setReadBigInts(true);
+  return statement.all(...params) as T[];
+}
+
+export function getBig<T>(db: DatabaseSync, sql: string, ...params: SqlValue[]): T | undefined {
+  queryCount += 1;
+  const statement = db.prepare(sql);
+  statement.setReadBigInts(true);
+  const row = statement.get(...params);
+  return row === undefined || row === null ? undefined : (row as T);
+}
+
 /** Leituras síncronas: contam como query, e como não cedem a vez entre uma e outra, nada as separa de uma escrita. */
 export function allNow<T>(db: DatabaseSync, sql: string, ...params: SqlValue[]): T[] {
   queryCount += 1;

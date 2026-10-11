@@ -1,6 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { deliveriesSince } from "./clock.ts";
-import { allNow, getNow, readSnapshot } from "./db.ts";
+import { allBig, getNow, getBig, readSnapshot } from "./db.ts";
 
 export type CreatorMatch = {
   id: string;
@@ -17,7 +17,9 @@ export type CreatorPage = {
 };
 
 type CampaignRow = { id: string; niches_json: string };
-type CountRow = { n: number };
+type CountRow = { n: bigint };
+/** Linha da página como o SQLite entrega: contadores em BigInt, porque o alcance pode passar de 2^53. */
+type PageRow = { id: string; name: string; niche_score: bigint; latest_reach: bigint; deliveries_90d: bigint };
 
 // niche_score = pares (nicho da campanha, nicho do criador) iguais, como no loop aninhado original.
 const SCORED = `
@@ -39,7 +41,7 @@ export async function listCreators(
 
     // Alcance: a métrica mais recente de cada conta (captured_at, desempate por id decrescente), somada por criador.
     // Tudo numa query só, então o número de queries não depende de quantos criadores existem.
-    const creators = allNow<CreatorMatch>(
+    const creators = allBig<PageRow>(
       db,
       `WITH scored AS (${SCORED}),
        ranked AS (
@@ -67,7 +69,7 @@ export async function listCreators(
     );
 
     // O total é separado da página para continuar correto quando o offset passa do fim.
-    const total = getNow<CountRow>(db, `SELECT COUNT(*) AS n FROM (${SCORED}) WHERE niche_score > 0`, campaign.niches_json);
+    const total = getBig<CountRow>(db, `SELECT COUNT(*) AS n FROM (${SCORED}) WHERE niche_score > 0`, campaign.niches_json);
 
     return {
       campaign_id: input.campaignId,
@@ -76,6 +78,7 @@ export async function listCreators(
         id: row.id,
         name: row.name,
         niche_score: Number(row.niche_score),
+        // A soma é exata no SQLite (e ordena por ela); o JSON leva o número de ponto flutuante mais próximo dela.
         latest_reach: Number(row.latest_reach),
         deliveries_90d: Number(row.deliveries_90d),
       })),
