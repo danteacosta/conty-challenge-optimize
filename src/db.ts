@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS deliveries (
   creator_id TEXT NOT NULL,
   delivered_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS accounts_creator ON social_accounts (creator_id, id);
+CREATE INDEX IF NOT EXISTS metrics_latest ON metrics (account_id, captured_at DESC, id DESC, views);
+CREATE INDEX IF NOT EXISTS deliveries_creator_date ON deliveries (creator_id, delivered_at);
 `;
 
 type SqlValue = string | number | bigint | null;
@@ -49,8 +52,57 @@ export function getQueryCount(): number {
 
 export function openDatabase(path = ":memory:"): DatabaseSync {
   const db = new DatabaseSync(path);
+  // SQLite ordena texto por UTF-8; o contrato original compara unidades UTF-16 do JavaScript.
+  db.function("js_string_key", { deterministic: true }, (value) =>
+    Buffer.from(String(value), "utf16le").swap16(),
+  );
   db.exec(SCHEMA);
   return db;
+}
+
+/**
+ * Leituras síncronas que devolvem inteiros como BigInt: a soma de contas individualmente seguras pode passar de 2^53, e o driver
+ * recusa ler esse inteiro como número. Contam como query igual às outras.
+ */
+export function allBig<T>(db: DatabaseSync, sql: string, ...params: SqlValue[]): T[] {
+  queryCount += 1;
+  const statement = db.prepare(sql);
+  statement.setReadBigInts(true);
+  return statement.all(...params) as T[];
+}
+
+export function getBig<T>(db: DatabaseSync, sql: string, ...params: SqlValue[]): T | undefined {
+  queryCount += 1;
+  const statement = db.prepare(sql);
+  statement.setReadBigInts(true);
+  const row = statement.get(...params);
+  return row === undefined || row === null ? undefined : (row as T);
+}
+
+/** Leituras síncronas: contam como query, e como não cedem a vez entre uma e outra, nada as separa de uma escrita. */
+export function allNow<T>(db: DatabaseSync, sql: string, ...params: SqlValue[]): T[] {
+  queryCount += 1;
+  return db.prepare(sql).all(...params) as T[];
+}
+
+export function getNow<T>(db: DatabaseSync, sql: string, ...params: SqlValue[]): T | undefined {
+  queryCount += 1;
+  const row = db.prepare(sql).get(...params);
+  return row === undefined || row === null ? undefined : (row as T);
+}
+
+/**
+ * Executa várias leituras como um único retrato do banco. Duas proteções: a função é síncrona (nenhum outro tratador da mesma
+ * conexão roda no meio) e o BEGIN/COMMIT fixa o retrato para quem escreve por outra conexão (em WAL, a leitura enxerga um
+ * estado só). Não pode conter `await`: segurar uma transação aberta por cima de espera é o que isso evita.
+ */
+export function readSnapshot<T>(db: DatabaseSync, read: () => T): T {
+  db.exec("BEGIN");
+  try {
+    return read();
+  } finally {
+    db.exec("COMMIT");
+  }
 }
 
 export async function all<T>(db: DatabaseSync, sql: string, ...params: SqlValue[]): Promise<T[]> {

@@ -1,0 +1,32 @@
+# Complemento da solução (segunda rodada)
+
+A primeira versão desta solução (3 queries, p95 ≈ 12 ms contra ≈ 557 ms da original) já cumpria o contrato. Esta rodada acrescenta dois ajustes, ambos vindos de uma auditoria independente e verificados de novo antes de entrar:
+
+1. **Consultas indexadas e entregas contadas só para a página.** A métrica mais recente de cada conta passa a ser lida por subconsulta indexada (em vez de ranquear todas as métricas com `ROW_NUMBER()`), e `deliveries_90d` é calculado apenas para os criadores da página, depois do `LIMIT/OFFSET`. Três índices direcionados em `src/db.ts`: `social_accounts (creator_id, id)`, `metrics (account_id, captured_at DESC, id DESC, views)` e `deliveries (creator_id, delivered_at)`.
+2. **Desempate por `id` igual ao do JavaScript.** O SQLite compara texto por bytes UTF-8 e o JavaScript, por unidades UTF-16, então `""` e `"\u{10000}"` saem em ordens diferentes. Uma função SQLite determinística (`js_string_key`, em `src/db.ts`) gera a chave UTF-16 big endian, usada antes do `LIMIT` e na ordem final. Isso fecha a ressalva sobre ids não ASCII que a versão anterior declarava.
+
+## Quem fez o quê
+
+O patch desta rodada foi escrito e revisado pelo Codex. Eu (Claude Code) o apliquei, rodei de novo os testes e o benchmark, apliquei mutação manual no SQL novo e acrescentei um teste que ele não tinha (ids Unicode dentro de uma página com mais de um criador). **A revisão humana do Dante ainda não foi feita**; a checklist no corpo do PR continua desmarcada.
+
+## Verificação
+
+- `npm test`: 43/43 (20 anteriores + 10 de consistência + 13 de agregados grandes) e `npm run typecheck` limpo em Node 22.15.0 e em 24.7.0. Os testes originais, `fixtures/page-1.json` e `src/app.ts` não mudaram.
+- O teste Unicode falha contra o código anterior e passa com o novo. A mutação manual no SQL (ordem, desempate da métrica, limite dos 90 dias, `OFFSET`, score zero, função UTF-16, ordem final da página) foi pega pelos testes, com uma exceção equivalente na prática: remover o `m.id DESC` da métrica não falha, porque o índice `metrics_latest` já entrega nessa ordem. Mantive o `id DESC` explícito no SQL para a regra não depender do plano de execução.
+- Benchmark (`npm run bench`, seed 2000/7, Node 24.7, 5 execuções cada, mesma máquina): 3 queries nos dois casos; p95 de **13,8 a 24,4 ms antes** e de **6,1 a 10,9 ms depois**. A auditoria mediu 13,2 → 6,6 ms. É ruidoso e local: serve como ordem de grandeza, não como garantia. Os índices também aceleram o oráculo de teste, então parte da diferença não é só do SQL novo.
+
+## Página e total do mesmo estado
+
+A listagem fazia três consultas separadas por `await`: campanha, página e total. Com uma escrita no meio (por exemplo, um criador excluído depois da consulta da página e antes da do total) a resposta saía com `total: 0` e um criador na página. Num banco parado isso não aparece, por isso o oráculo de equivalência não pega. Agora as três leituras rodam numa função síncrona dentro de um `BEGIN`/`COMMIT` (`readSnapshot` em `src/db.ts`): nenhum outro tratador da mesma conexão roda no meio e, em arquivo com WAL, quem escreve por outra conexão também não é visto no meio. A função não contém `await`, para a transação nunca ficar aberta por cima de espera nem de rede. Continuam 3 queries (teto de 8), a ordenação UTF-16 e o score com multiplicidade. `test/consistency.test.ts` roda um escritor em sete pontos diferentes da listagem (apagando e inserindo) e exige que a resposta seja inteira do estado anterior ou do posterior; contra o código anterior ele falha. Bench depois da mudança: 3 queries, p95 5,3 ms (uma execução, mesma máquina).
+
+## Agregados acima de 2^53
+
+O alcance de um criador soma a métrica mais recente de cada conta. Contas individualmente seguras (até 2^53 − 1) podem somar mais que isso; o driver do `node:sqlite` recusa ler esse inteiro como número e a listagem respondia 500. Decisão de contrato: **a soma é exata** no SQLite (inteiro de 64 bits), a **ordenação usa a soma exata** e o JSON leva o **número de ponto flutuante mais próximo** da soma exata (`Number(BigInt)`). Por isso `latest_reach` só deixa de ser um inteiro exato acima de 2^53, como já acontecia com a soma em JavaScript do original; a diferença para o original é que dois alcances que viram o mesmo número em ponto flutuante ficam na ordem verdadeira em vez de empatar por id, e que uma soma acima de 2^53 dá 200 em vez de 500. As leituras passam por `allBig`/`getBig` (`setReadBigInts`). Não usei `SUM → TOTAL`: `TOTAL` devolve ponto flutuante e perderia a ordem exata. **Domínio**: a coluna `views` é de contagem (inteiro não negativo). Sinais mistos são tratados (as metades são canonizadas com resto em [0, 2^32), e um teste prova a ordem exata); um valor fracionário é lido como inteiro (truncado), porque o original, que somava em ponto flutuante, não é um contrato que valha a pena reproduzir para contagens.
+
+**Acima de 64 bits**: o `SUM` do SQLite aborta com `integer overflow` quando a soma passa de 2^63 (reproduzido com 1.025 contas de 2^53 − 1). A soma agora é feita em duas metades de 32 bits (`views / 2^32` e `views % 2^32`, cada uma sem risco de estourar), normalizada em `reach_hi * 2^32 + reach_lo`; ordenar por `(reach_hi, reach_lo)` é ordenar pela soma exata, então o ranking continua exato, sem limite de 64 bits (o acumulador que estoura primeiro é o das metades baixas, cujo termo vai até 2^32 − 1: o limite passa a ser cerca de 2^31 contas por criador, 2,1 bilhões, muito além de qualquer volume real; confirmado medindo 2^31 e 2^31 + 1 linhas). A ordenação Unicode, o snapshot de leitura e as 3 queries ficam como estavam; o CTE `latest` calcula só as contas dos criadores que casam com algum nicho. Bench depois da mudança (3 queries, 2000 criadores, 4 execuções): p95 de cerca de 8 ms, contra 5 a 6 ms antes dela: a soma em duas metades e o CTE custam cerca de 2 ms; continua dentro da faixa de 6 a 11 ms já medida para a versão com índices, e bem abaixo dos 550 ms do original. `test/large-aggregates.test.ts` cobre o 200 acima de 2^53, o arredondamento para o número mais próximo, a ordem exata de dois alcances que empatariam como número e a paginação com valores pequenos.
+
+## Riscos
+
+- Os índices mudam o schema em `src/db.ts`; `CREATE INDEX IF NOT EXISTS` é idempotente, mas bancos grandes pagam o custo de criá-los na primeira abertura.
+- `db.function` exige Node 22.13+ (no 22.15 e no 24.7 funciona; não testei versões anteriores).
+- Não rodei contra volumes de produção.
