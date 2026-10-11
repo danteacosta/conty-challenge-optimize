@@ -50,19 +50,24 @@ export async function listCreators(
        -- estouram, e normalizada: reach = hi * 2^32 + lo. Ordenar por (hi, lo) é ordenar pela soma exata, sem limite de 64 bits.
        latest AS (
          SELECT a.creator_id AS creator_id,
-                COALESCE((SELECT m.views FROM metrics m WHERE m.account_id = a.id
-                           ORDER BY m.captured_at DESC, m.id DESC LIMIT 1), 0) AS views
+                CAST(COALESCE((SELECT m.views FROM metrics m WHERE m.account_id = a.id
+                           ORDER BY m.captured_at DESC, m.id DESC LIMIT 1), 0) AS INTEGER) AS views
            FROM social_accounts a
           WHERE a.creator_id IN (SELECT id FROM scored WHERE niche_score > 0)
        ),
        halves AS (
          SELECT creator_id, SUM(views / 4294967296) AS hi, SUM(views % 4294967296) AS lo FROM latest GROUP BY creator_id
        ),
+       -- "/" e "%" do SQLite truncam em direção a zero: com valores de sinais misturados o resto sai negativo e o par (hi, lo)
+       -- deixa de ser canônico. O resto é levado para [0, 2^32) e a diferença volta para hi, então reach = hi * 2^32 + lo sempre.
+       canonical AS (
+         SELECT creator_id, hi + (lo - ((lo % 4294967296) + 4294967296) % 4294967296) / 4294967296 AS reach_hi,
+                ((lo % 4294967296) + 4294967296) % 4294967296 AS reach_lo
+           FROM halves
+       ),
        ranked AS (
-         SELECT s.id, s.name, s.niche_score,
-                COALESCE(h.hi, 0) + COALESCE(h.lo, 0) / 4294967296 AS reach_hi,
-                COALESCE(h.lo, 0) % 4294967296 AS reach_lo
-           FROM scored s LEFT JOIN halves h ON h.creator_id = s.id
+         SELECT s.id, s.name, s.niche_score, COALESCE(c.reach_hi, 0) AS reach_hi, COALESCE(c.reach_lo, 0) AS reach_lo
+           FROM scored s LEFT JOIN canonical c ON c.creator_id = s.id
           WHERE s.niche_score > 0
        ),
        page AS (

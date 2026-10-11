@@ -87,4 +87,65 @@ describe("agregados acima de 2^53 não derrubam a listagem", () => {
       expect(first!.total).toBe(3);
     });
   });
+
+  describe("valores com sinal misto e REAL (fora do domínio de contagem, mas o schema os aceita)", () => {
+    const P = 4294967296;
+
+    it("soma com sinais misturados ordena pela soma exata: [2^32, -5] (soma 2^32 - 5) fica atrás de [2^32 - 3]", async () => {
+      const db = database({ x: [P, -5], y: [P - 3] });
+      const page = await listCreators(db, { campaignId: "c", limit: 20, offset: 0 });
+      expect(page!.creators.map((c) => [c.id, c.latest_reach])).toEqual([["y", P - 3], ["x", P - 5]]);
+    });
+
+    it("somas iguais com decomposições diferentes empatam e desempatam por id", async () => {
+      const db = database({ x: [P, -1], a: [P - 1] });
+      const page = await listCreators(db, { campaignId: "c", limit: 20, offset: 0 });
+      expect(page!.creators.map((c) => c.id)).toEqual(["a", "x"]);
+    });
+
+    it("soma negativa também ordena certo", async () => {
+      const db = database({ a: [-P, 3], b: [-P + 3] });
+      const page = await listCreators(db, { campaignId: "c", limit: 20, offset: 0 });
+      expect(page!.creators.map((c) => c.id)).toEqual(["a", "b"]);
+      expect(page!.creators[0]!.latest_reach).toBe(-P + 3);
+    });
+
+    it("valor REAL (1,5) não derruba a listagem: é lido como inteiro (truncado), e a resposta é 200", async () => {
+      const db = database({ a: [1] });
+      db.prepare("UPDATE metrics SET views = 1.5").run();
+      const page = await listCreators(db, { campaignId: "c", limit: 20, offset: 0 });
+      expect(page!.creators[0]!.latest_reach).toBe(1);
+    });
+  });
+
+  it("contra um oráculo em BigInt: 300 conjuntos pseudoaleatórios (semente fixa) com valores até 2^53, sinais mistos, empates e somas acima de 64 bits", async () => {
+    let state = 123456789;
+    const next = () => {
+      state = (Math.imul(state, 1103515245) + 12345) >>> 0;
+      return state / 4294967296;
+    };
+    const value = () => {
+      const kind = next();
+      if (kind < 0.25) return 0;
+      if (kind < 0.5) return Math.floor(next() * 100) - 50;
+      if (kind < 0.75) return Math.floor(next() * 2 ** 33) - 2 ** 32;
+      return (next() < 0.3 ? -1 : 1) * Math.floor(next() * Number.MAX_SAFE_INTEGER);
+    };
+    for (let round = 0; round < 300; round += 1) {
+      const creators: Record<string, number[]> = {};
+      const count = 2 + Math.floor(next() * 4);
+      for (let k = 0; k < count; k += 1) {
+        const accounts = 1 + Math.floor(next() * (round % 10 === 0 ? 1100 : 6));
+        creators[`c${k}`] = Array.from({ length: accounts }, value);
+      }
+      if (round % 3 === 0) creators.dup = [...creators.c0!]; // soma exatamente igual: desempate por id
+      const db = database(creators);
+      const page = await listCreators(db, { campaignId: "c", limit: 50, offset: 0 });
+      const expected = Object.entries(creators)
+        .map(([id, views]) => ({ id, sum: views.reduce((s, v) => s + BigInt(v), 0n) }))
+        .sort((a, b) => (a.sum === b.sum ? (a.id < b.id ? -1 : 1) : a.sum > b.sum ? -1 : 1));
+      expect(page!.creators.map((c) => c.id), `rodada ${round}`).toEqual(expected.map((e) => e.id));
+      expect(page!.creators.map((c) => c.latest_reach), `rodada ${round}`).toEqual(expected.map((e) => Number(e.sum)));
+    }
+  }, 60_000);
 });
