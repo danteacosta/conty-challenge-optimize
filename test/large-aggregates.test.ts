@@ -52,4 +52,39 @@ describe("agregados acima de 2^53 não derrubam a listagem", () => {
     const next = await listCreators(db, { campaignId: "c", limit: 2, offset: 2 });
     expect(next!.creators.map((c) => c.id)).toEqual(["c"]);
   });
+
+  describe("acima de 64 bits (o SUM do SQLite estoura)", () => {
+    const MAX = MAX_SAFE;
+    const many = (n: number, value = MAX, last = value) => Array.from({ length: n }, (_, i) => (i === n - 1 ? last : value));
+
+    it("1.025 contas de valores individualmente seguros somam mais que 2^63: 200, e o valor é o número mais próximo da soma exata", async () => {
+      const db = database({ a: many(1025) });
+      const page = await listCreators(db, { campaignId: "c", limit: 20, offset: 0 });
+      expect(page).not.toBeNull();
+      expect(page!.creators[0]!.latest_reach).toBe(Number(BigInt(MAX) * 1025n));
+      expect(page!.total).toBe(1);
+    });
+
+    it("a ordem continua exata: a soma maior por UMA unidade, acima de 64 bits, vem primeiro, mesmo com o id pior", async () => {
+      const db = database({ a: many(1025, MAX, MAX - 1), b: many(1025) }); // b = a + 1; por id, "a" viria antes
+      const page = await listCreators(db, { campaignId: "c", limit: 20, offset: 0 });
+      expect(page!.creators.map((c) => c.id)).toEqual(["b", "a"]);
+      expect(page!.creators[0]!.latest_reach).toBe(page!.creators[1]!.latest_reach); // o mesmo número no JSON
+    });
+
+    it("o desempate por id continua sendo o do JavaScript quando as somas exatas são iguais", async () => {
+      const db = database({ b: many(1025), a: many(1025), "\u{10000}": many(1025), "\uffff": many(1025) });
+      const page = await listCreators(db, { campaignId: "c", limit: 20, offset: 0 });
+      expect(page!.creators.map((c) => c.id)).toEqual(["a", "b", "\uffff", "\u{10000}"].sort()); // unidades UTF-16, como no original
+    });
+
+    it("a paginação e o total continuam coerentes com somas gigantes", async () => {
+      const db = database({ a: many(1025), b: many(1025, MAX, 5), c: [10] });
+      const first = await listCreators(db, { campaignId: "c", limit: 1, offset: 0 });
+      const second = await listCreators(db, { campaignId: "c", limit: 1, offset: 1 });
+      const third = await listCreators(db, { campaignId: "c", limit: 1, offset: 2 });
+      expect([first, second, third].map((p) => p!.creators[0]!.id)).toEqual(["a", "b", "c"]);
+      expect(first!.total).toBe(3);
+    });
+  });
 });

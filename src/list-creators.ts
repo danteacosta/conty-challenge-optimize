@@ -17,9 +17,10 @@ export type CreatorPage = {
 };
 
 type CampaignRow = { id: string; niches_json: string };
+const HALF = 4294967296n; // 2^32
 type CountRow = { n: bigint };
 /** Linha da página como o SQLite entrega: contadores em BigInt, porque o alcance pode passar de 2^53. */
-type PageRow = { id: string; name: string; niche_score: bigint; latest_reach: bigint; deliveries_90d: bigint };
+type PageRow = { id: string; name: string; niche_score: bigint; reach_hi: bigint; reach_lo: bigint; deliveries_90d: bigint };
 
 // niche_score = pares (nicho da campanha, nicho do criador) iguais, como no loop aninhado original.
 const SCORED = `
@@ -44,24 +45,36 @@ export async function listCreators(
     const creators = allBig<PageRow>(
       db,
       `WITH scored AS (${SCORED}),
+       -- O alcance é a soma das métricas mais recentes de cada conta. Cada valor é um inteiro seguro (até 2^53 - 1), mas a soma de
+       -- muitas contas pode passar de 2^63 e o SUM do SQLite aborta. Por isso a soma é feita em duas metades de 32 bits, que não
+       -- estouram, e normalizada: reach = hi * 2^32 + lo. Ordenar por (hi, lo) é ordenar pela soma exata, sem limite de 64 bits.
+       latest AS (
+         SELECT a.creator_id AS creator_id,
+                COALESCE((SELECT m.views FROM metrics m WHERE m.account_id = a.id
+                           ORDER BY m.captured_at DESC, m.id DESC LIMIT 1), 0) AS views
+           FROM social_accounts a
+          WHERE a.creator_id IN (SELECT id FROM scored WHERE niche_score > 0)
+       ),
+       halves AS (
+         SELECT creator_id, SUM(views / 4294967296) AS hi, SUM(views % 4294967296) AS lo FROM latest GROUP BY creator_id
+       ),
        ranked AS (
          SELECT s.id, s.name, s.niche_score,
-                COALESCE((SELECT SUM(COALESCE((
-                  SELECT m.views FROM metrics m WHERE m.account_id = a.id
-                   ORDER BY m.captured_at DESC, m.id DESC LIMIT 1
-                ), 0)) FROM social_accounts a WHERE a.creator_id = s.id), 0) AS latest_reach
-           FROM scored s WHERE s.niche_score > 0
+                COALESCE(h.hi, 0) + COALESCE(h.lo, 0) / 4294967296 AS reach_hi,
+                COALESCE(h.lo, 0) % 4294967296 AS reach_lo
+           FROM scored s LEFT JOIN halves h ON h.creator_id = s.id
+          WHERE s.niche_score > 0
        ),
        page AS (
          SELECT * FROM ranked
-          ORDER BY niche_score DESC, latest_reach DESC, js_string_key(id) ASC
+          ORDER BY niche_score DESC, reach_hi DESC, reach_lo DESC, js_string_key(id) ASC
           LIMIT ? OFFSET ?
        )
-       SELECT p.id, p.name, p.niche_score, p.latest_reach,
+       SELECT p.id, p.name, p.niche_score, p.reach_hi, p.reach_lo,
               (SELECT COUNT(*) FROM deliveries d
                 WHERE d.creator_id = p.id AND d.delivered_at >= ?) AS deliveries_90d
          FROM page p
-        ORDER BY p.niche_score DESC, p.latest_reach DESC, js_string_key(p.id) ASC`,
+        ORDER BY p.niche_score DESC, p.reach_hi DESC, p.reach_lo DESC, js_string_key(p.id) ASC`,
       campaign.niches_json,
       input.limit,
       input.offset,
@@ -78,8 +91,8 @@ export async function listCreators(
         id: row.id,
         name: row.name,
         niche_score: Number(row.niche_score),
-        // A soma é exata no SQLite (e ordena por ela); o JSON leva o número de ponto flutuante mais próximo dela.
-        latest_reach: Number(row.latest_reach),
+        // A soma é exata (duas metades de 32 bits, sem limite de 64 bits) e ordena por ela; o JSON leva o número de ponto flutuante mais próximo.
+        latest_reach: Number(row.reach_hi * HALF + row.reach_lo),
         deliveries_90d: Number(row.deliveries_90d),
       })),
     };
